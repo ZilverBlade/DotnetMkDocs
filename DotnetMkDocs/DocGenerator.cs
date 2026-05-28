@@ -1,6 +1,5 @@
 ﻿using DocXml.Reflection;
 using LoxSmoke.DocXml;
-using System.ComponentModel.Design;
 using System.Reflection;
 using System.Runtime.Loader;
 using System.Text;
@@ -9,6 +8,25 @@ namespace DotnetMkDocs;
 
 public class DocGenerator
 {
+    private string[] GetNamespaceParts(string ns)
+    {
+        if (string.IsNullOrEmpty(ns)) return Array.Empty<string>();
+
+        string[] rawParts = ns.Split('.');
+
+        // If it's your project structure, bundle the first 3 parts as the root assembly folder
+        if (rawParts.Length >= 3 && rawParts[0] == "SDT4" && rawParts[1] == "Managed")
+        {
+            string rootAsm = $"{rawParts[0]}.{rawParts[1]}.{rawParts[2]}";
+            var parts = new List<string> { rootAsm };
+            if (rawParts.Length > 3) parts.AddRange(rawParts.Skip(3).Select(p => p.ToLower()));
+            return parts.ToArray();
+        }
+
+        // Fallback for any other random namespaces
+        return rawParts.Select(p => p.ToLower()).ToArray();
+    }
+
     string GetTypeReferenceCanonical(Type currentType, Type targetType)
     {
         string currentNs = currentType.Namespace ?? string.Empty;
@@ -17,18 +35,15 @@ public class DocGenerator
         // Intercept System and Microsoft types and point to official Docs
         if (targetNs.StartsWith("System") || targetNs.StartsWith("Microsoft"))
         {
-            // Microsoft routes generics using dashes (e.g. List`1 becomes list-1)
             string cleanName = targetType.Name.Replace('`', '-').ToLower();
             return $"https://learn.microsoft.com/dotnet/api/{targetNs.ToLower()}.{cleanName}";
         }
 
-        // If they are in the exact same namespace, link directly to the file
         if (currentNs == targetNs)
-            return $"{targetType.Name.ToLower()}.md";
+            return $"./{targetType.Name.ToLower()}.md";
 
-        // Calculate relative path for your own cross-module classes
-        string[] sourceParts = string.IsNullOrEmpty(currentNs) ? Array.Empty<string>() : currentNs.ToLower().Split('.');
-        string[] targetParts = string.IsNullOrEmpty(targetNs) ? Array.Empty<string>() : targetNs.ToLower().Split('.');
+        string[] sourceParts = GetNamespaceParts(currentNs);
+        string[] targetParts = GetNamespaceParts(targetNs);
 
         int commonCount = 0;
         int minLength = Math.Min(sourceParts.Length, targetParts.Length);
@@ -39,13 +54,10 @@ public class DocGenerator
         }
 
         int dirsUp = sourceParts.Length - commonCount;
-        string upPath = string.Concat(Enumerable.Repeat("../", dirsUp));
+        string upPath = dirsUp == 0 ? "./" : string.Concat(Enumerable.Repeat("../", dirsUp));
 
         string downPath = string.Join("/", targetParts.Skip(commonCount));
-        if (!string.IsNullOrEmpty(downPath))
-        {
-            downPath += "/";
-        }
+        if (!string.IsNullOrEmpty(downPath)) downPath += "/";
 
         return $"{upPath}{downPath}{targetType.Name.ToLower()}.md";
     }
@@ -84,7 +96,6 @@ public class DocGenerator
         {
             var genericArgs = string.Join(", ", type.GenericTypeArguments.Select(g => GetTypeReference(nullabilityInfo, currentType, g, false)));
 
-            // Safety check: ensure the backtick actually exists before substringing
             int backtickIndex = type.Name.IndexOf('`');
             string cleanName = backtickIndex >= 0 ? type.Name.Substring(0, backtickIndex) : type.Name;
 
@@ -93,7 +104,6 @@ public class DocGenerator
             else return nolink1;
         }
 
-        // Standard types
         string nolink = $"{type.Name}{append}";
         if (link) return $"[{nolink}]({GetTypeReferenceCanonical(currentType, type)})";
         else return nolink;
@@ -115,8 +125,9 @@ public class DocGenerator
         Assembly assembly = context.LoadFromAssemblyPath(dllFilePath);
 
         BindingFlags declaredFlags = BindingFlags.Public | BindingFlags.NonPublic |
-                             BindingFlags.Instance | BindingFlags.Static |
-                             BindingFlags.DeclaredOnly;
+                                     BindingFlags.Instance | BindingFlags.Static |
+                                     BindingFlags.DeclaredOnly;
+
         var namespaceGroups = new Dictionary<string, List<(Type Type, string Summary)>>();
 
         foreach (var type in assembly.ExportedTypes)
@@ -125,7 +136,6 @@ public class DocGenerator
 
             string className = type.Name;
 
-            // Null safety for type comments
             var xmlType = reader.GetTypeComments(type);
             string typeSummary = xmlType?.Summary?.Trim() ?? "";
 
@@ -171,10 +181,8 @@ public class DocGenerator
                 bool isPublic = isGetterPublic || isSetterPublic;
                 bool isProtected = isGetterProtected || isSetterProtected;
 
-                // Visibility filtering
-                if (!isPublic && !isProtected) continue; // Hide private/internal
-                if (!isPublic && isProtected && type.IsSealed) continue; // Hide protected if sealed
-
+                if (!isPublic && !isProtected) continue;
+                if (!isPublic && isProtected && type.IsSealed) continue;
                 var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("<br>", " ").Replace("|", "\\|").Trim() ?? "";
 
                 string modifiers = string.Empty;
@@ -193,16 +201,8 @@ public class DocGenerator
                         modifiers += p.IsPublic ? "public " : "protected ";
                         if (p.IsStatic) modifiers += " static";
                     };
-                    if (getter != null)
-                    {
-                        AppendModifiers(getter);
-                        modifiers += "get; ";
-                    }
-                    if (setter != null)
-                    {
-                        AppendModifiers(setter);
-                        modifiers += "set; ";
-                    }
+                    if (getter != null) { AppendModifiers(getter); modifiers += "get; "; }
+                    if (setter != null) { AppendModifiers(setter); modifiers += "set; "; }
                 }
 
                 var nullabilityInfo = new NullabilityInfoContext().Create(property);
@@ -213,10 +213,9 @@ public class DocGenerator
             {
                 if (method.IsSpecialName) continue;
 
-                // Visibility filtering
                 bool isProtected = method.IsFamily || method.IsFamilyOrAssembly;
-                if (method.IsPrivate || method.IsAssembly) continue; // Hide private/internal
-                if (isProtected && type.IsSealed) continue;        // Hide protected if sealed
+                if (method.IsPrivate || method.IsAssembly) continue;
+                if (isProtected && type.IsSealed) continue;
 
                 var xmlMethod = reader.GetMethodComments(method);
                 var parameters = method.GetParameters();
@@ -262,13 +261,10 @@ public class DocGenerator
                 {
                     methodBuilder.AppendLine("**Parameters:**");
                     methodBuilder.AppendLine();
-
                     foreach (var p in parameters)
                     {
-                        // Null safety for parameter comments
                         var xmlParam = xmlMethod?.Parameters?.FirstOrDefault(x => x.Name == p.Name);
                         string paramDescription = xmlParam?.Text?.Trim() ?? "";
-
                         methodBuilder.AppendLine($"- `{p.Name}` ({GetTypeReference(new NullabilityInfoContext().Create(p), type, p.ParameterType)}): {paramDescription}");
                         methodBuilder.AppendLine();
                     }
@@ -279,12 +275,8 @@ public class DocGenerator
                 {
                     methodBuilder.AppendLine("**Returns:**");
                     methodBuilder.AppendLine();
-
-                    // Null safety for return comments
                     string returnDescription = xmlMethod?.Returns?.Trim() ?? "";
-
-                    methodBuilder.AppendLine($"- {GetTypeReference(new NullabilityInfoContext().Create(method.ReturnParameter),
-                        type, method.ReturnType)}: {returnDescription}");
+                    methodBuilder.AppendLine($"- {GetTypeReference(new NullabilityInfoContext().Create(method.ReturnParameter), type, method.ReturnType)}: {returnDescription}");
                     methodBuilder.AppendLine();
                 }
 
@@ -304,6 +296,7 @@ public class DocGenerator
                 if (type.IsAbstract && !type.IsInterface) typeDeclarationModifier += "abstract ";
                 if (type.IsSealed && !type.IsValueType) typeDeclarationModifier += "sealed ";
             }
+
             List<string> parents = new();
             Type? parent = type.BaseType;
             while (parent is not null)
@@ -368,8 +361,8 @@ public class DocGenerator
                     ---
                     """";
 
-            string relativeNamespacePath = type.Namespace?.Replace('.', '/') ?? string.Empty;
-            string finalDirectory = Path.Combine(rootOutputDirectory, relativeNamespacePath.ToLower());
+            string[] nsParts = GetNamespaceParts(type.Namespace ?? string.Empty);
+            string finalDirectory = Path.Combine(rootOutputDirectory, string.Join("/", nsParts));
             Directory.CreateDirectory(finalDirectory);
             File.WriteAllText(Path.Combine(finalDirectory, $"{className.ToLower()}.md"), template);
         }
@@ -379,6 +372,8 @@ public class DocGenerator
         indexBuilder.AppendLine();
         indexBuilder.AppendLine("## Namespaces");
         indexBuilder.AppendLine();
+
+        string[] sourceNsParts = GetNamespaceParts(assemblyName); // The index.md lives at the root folder of the assembly
 
         foreach (var kvp in namespaceGroups.OrderBy(x => x.Key))
         {
@@ -392,11 +387,18 @@ public class DocGenerator
             {
                 string cleanSummary = t.Summary.Replace("\n", " ").Replace("|", "\\|").Trim();
 
-                string relativeNamespacePath = t.Type.Namespace?.Replace('.', '/') ?? string.Empty;
+                string[] targetNsParts = GetNamespaceParts(t.Type.Namespace ?? string.Empty);
+
+                // Calculate relative path from the root index.md down into the subfolders
+                int commonCount = 0;
+                while (commonCount < Math.Min(sourceNsParts.Length, targetNsParts.Length) && sourceNsParts[commonCount] == targetNsParts[commonCount])
+                    commonCount++;
+
+                string downPath = string.Join("/", targetNsParts.Skip(commonCount));
+                if (!string.IsNullOrEmpty(downPath)) downPath += "/";
+
                 string fileName = $"{t.Type.Name.ToLower()}.md";
-                string linkPath = string.IsNullOrEmpty(relativeNamespacePath)
-                    ? $"./{fileName}"
-                    : $"./{relativeNamespacePath}/{fileName}".ToLower();
+                string linkPath = $"./{downPath}{fileName}";
 
                 string displayName = t.Type.Name;
                 if (t.Type.IsGenericType)
@@ -413,6 +415,9 @@ public class DocGenerator
             indexBuilder.AppendLine();
         }
 
-        File.WriteAllText(Path.Combine(rootOutputDirectory, "index.md"), indexBuilder.ToString());
+        // SAVE THE INDEX FILE AT THE ROOT OF THE ASSEMBLY FOLDER
+        string assemblyFolder = Path.Combine(rootOutputDirectory, assemblyName);
+        Directory.CreateDirectory(assemblyFolder);
+        File.WriteAllText(Path.Combine(assemblyFolder, "index.md"), indexBuilder.ToString());
     }
 }
