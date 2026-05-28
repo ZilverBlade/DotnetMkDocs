@@ -1,6 +1,7 @@
-﻿using LoxSmoke.DocXml;
+﻿using DocXml.Reflection;
+using LoxSmoke.DocXml;
+using System.ComponentModel.Design;
 using System.Reflection;
-using System.Runtime.InteropServices;
 using System.Runtime.Loader;
 using System.Text;
 
@@ -8,21 +9,27 @@ namespace DotnetMkDocs;
 
 public class DocGenerator
 {
-    // gets the markdown link path relative to the current file.
     string GetTypeReferenceCanonical(Type currentType, Type targetType)
     {
-        // Safety check for generic parameters (like T) that don't have namespaces
-        if (string.IsNullOrEmpty(currentType.Namespace) || string.IsNullOrEmpty(targetType.Namespace))
+        string currentNs = currentType.Namespace ?? string.Empty;
+        string targetNs = targetType.Namespace ?? string.Empty;
+
+        // Intercept System and Microsoft types and point to official Docs
+        if (targetNs.StartsWith("System") || targetNs.StartsWith("Microsoft"))
+        {
+            // Microsoft routes generics using dashes (e.g. List`1 becomes list-1)
+            string cleanName = targetType.Name.Replace('`', '-').ToLower();
+            return $"https://learn.microsoft.com/dotnet/api/{targetNs.ToLower()}.{cleanName}";
+        }
+
+        // If they are in the exact same namespace, link directly to the file
+        if (currentNs == targetNs)
             return $"{targetType.Name.ToLower()}.md";
 
-        // If they are in the exact same namespace, just link the file directly
-        if (currentType.Namespace == targetType.Namespace)
-            return $"{targetType.Name.ToLower()}.md";
+        // Calculate relative path for your own cross-module classes
+        string[] sourceParts = string.IsNullOrEmpty(currentNs) ? Array.Empty<string>() : currentNs.Split('.');
+        string[] targetParts = string.IsNullOrEmpty(targetNs) ? Array.Empty<string>() : targetNs.Split('.');
 
-        string[] sourceParts = currentType.Namespace.Split('.');
-        string[] targetParts = targetType.Namespace.Split('.');
-
-        // Find how many namespace segments they share (the common root)
         int commonCount = 0;
         int minLength = Math.Min(sourceParts.Length, targetParts.Length);
 
@@ -30,17 +37,23 @@ public class DocGenerator
         {
             commonCount++;
         }
+
         int dirsUp = sourceParts.Length - commonCount;
         string upPath = string.Concat(Enumerable.Repeat("../", dirsUp));
+
         string downPath = string.Join("/", targetParts.Skip(commonCount)).ToLower();
         if (!string.IsNullOrEmpty(downPath))
         {
             downPath += "/";
         }
+
         return $"{upPath}{downPath}{targetType.Name.ToLower()}.md";
     }
-    string GetTypeReference(Type currentType, Type type)
+
+    string GetTypeReference(Type currentType, Type type, bool link = true)
     {
+        if (link && type.IsGenericType) return GetTypeReference(currentType, type, false);
+        var GetElementName = (Type t) => $"{type.Name}{(type.IsNullable() ? "?" : "")}";
         if (type.IsByRef)
         {
             return GetTypeReference(currentType, type.GetElementType()!);
@@ -48,32 +61,38 @@ public class DocGenerator
         else if (type.IsArray)
         {
             var elementType = type.GetElementType()!;
-            return $"[{elementType.Name}[]]({GetTypeReferenceCanonical(currentType, elementType)})";
+            string nolink0 = $"{GetElementName(elementType)}[]";
+            if (link) return $"[{nolink0}]({GetTypeReferenceCanonical(currentType, elementType)})";
+            else return nolink0;
         }
         else if (type.IsGenericTypeDefinition || type.IsGenericType)
         {
-            // Recursively call GetTypeReference to handle nested generics
-            var genericArgs = string.Join(", ", type.GenericTypeArguments.Select(g => GetTypeReference(currentType, g)));
+            var genericArgs = string.Join(", ", type.GenericTypeArguments.Select(g => GetTypeReference(currentType, g, false)));
 
-            return $"[{type.Name.Substring(0, type.Name.LastIndexOf('`'))}&lt;{genericArgs}&gt;]({GetTypeReferenceCanonical(currentType, type)})";
+            // Safety check: ensure the backtick actually exists before substringing
+            int backtickIndex = type.Name.IndexOf('`');
+            string cleanName = backtickIndex >= 0 ? type.Name.Substring(0, backtickIndex) : type.Name;
+
+            string nolink1 = $"{cleanName}&lt;{genericArgs}&gt;";
+            if (link) return $"[{nolink1}]({GetTypeReferenceCanonical(currentType, type)})";
+            else return nolink1;
         }
-        return $"[{type.Name}]()";
+        string nolink = $"{GetElementName(type)}";
+        if (link) return $"[{nolink}]({GetTypeReferenceCanonical(currentType, type)})";
+        else return nolink;
     }
 
     public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string assemblyName, string rootOutputDirectory)
     {
-        string outputFolder = Path.Combine(rootOutputDirectory, assemblyName);
-        Directory.CreateDirectory(outputFolder);
+        Directory.CreateDirectory(rootOutputDirectory);
 
         DocXmlReader reader = new DocXmlReader(xmlFilePath);
 
         string dllDirectory = Path.GetDirectoryName(dllFilePath)!;
-
-        var resolverPaths = new List<string>(Directory.GetFiles(RuntimeEnvironment.GetRuntimeDirectory(), "*.dll"));
+        var resolverPaths = new List<string>(Directory.GetFiles(System.Runtime.InteropServices.RuntimeEnvironment.GetRuntimeDirectory(), "*.dll"));
         resolverPaths.AddRange(Directory.GetFiles(dllDirectory, "*.dll"));
 
         var resolver = new PathAssemblyResolver(resolverPaths);
-
         using var context = new MetadataLoadContext(resolver);
 
         Assembly assembly = context.LoadFromAssemblyPath(dllFilePath);
@@ -84,7 +103,9 @@ public class DocGenerator
 
             string className = type.Name;
 
+            // Null safety for type comments
             var xmlType = reader.GetTypeComments(type);
+            string typeSummary = xmlType?.Summary?.Trim() ?? "";
 
             StringBuilder fieldBuilder = new();
             StringBuilder propertyBuilder = new();
@@ -92,19 +113,29 @@ public class DocGenerator
 
             foreach (var field in type.GetFields())
             {
+                if (field.IsSpecialName) continue;
                 var xmlField = reader.GetMemberComment(field)?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
-                fieldBuilder.AppendLine($"| `{field.Name}` | {GetTypeReference(type, field.FieldType)} | {xmlField} |");
+                string modifiers = string.Empty;
+                if (!type.IsEnum)
+                {
+                    if (field.IsPublic) modifiers += "public ";
+                    if (field.IsStatic) modifiers += "static ";
+                }
+                fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(type, field.FieldType)} | {xmlField} |");
             }
 
             foreach (var property in type.GetProperties())
             {
+                if (property.IsSpecialName) continue;
                 var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
-                propertyBuilder.AppendLine($"| `{property.Name}` | {GetTypeReference(type, property.PropertyType)} | {xmlProperty} |");
+                string modifiers = string.Empty;
+                propertyBuilder.AppendLine($"|`{modifiers}{property.Name}` | {GetTypeReference(type, property.PropertyType)} | {xmlProperty} |");
             }
 
-            // Loop through the methods inside this class
             foreach (var method in type.GetMethods())
             {
+                if (method.IsSpecialName) continue;
+                // Null safety for methods
                 var xmlMethod = reader.GetMethodComments(method);
                 var parameters = method.GetParameters();
 
@@ -121,13 +152,13 @@ public class DocGenerator
 
                 string joinedParams = string.Join(", ", paramSignatures);
 
-                methodBuilder.AppendLine($"### `{method.Name}({joinedParams})`");
+                methodBuilder.AppendLine($"### {method.Name}({joinedParams})");
                 methodBuilder.AppendLine();
 
-                if (!string.IsNullOrWhiteSpace(xmlMethod.Summary))
+                string methodSummary = xmlMethod?.Summary?.Replace("\n", " ").Trim() ?? "";
+                if (!string.IsNullOrWhiteSpace(methodSummary))
                 {
-                    // Replace newlines so it formats cleanly in MkDocs
-                    methodBuilder.AppendLine(xmlMethod.Summary.Replace("\n", " ").Trim());
+                    methodBuilder.AppendLine(methodSummary);
                     methodBuilder.AppendLine();
                 }
 
@@ -137,58 +168,43 @@ public class DocGenerator
 
                     foreach (var p in parameters)
                     {
-                        // Try to find the matching <param name="x"> tag from the XML
-                        var xmlParam = xmlMethod.Parameters?.FirstOrDefault(x => x.Name == p.Name);
-                        string paramDescription = xmlParam?.Text.Trim() ?? "";
+                        // Null safety for parameter comments
+                        var xmlParam = xmlMethod?.Parameters?.FirstOrDefault(x => x.Name == p.Name);
+                        string paramDescription = xmlParam?.Text?.Trim() ?? "";
 
-                        methodBuilder.AppendLine($"* `{p.Name}` (`{GetTypeReference(type, p.ParameterType)}`): {paramDescription}");
+                        methodBuilder.AppendLine($"- `{p.Name}` ({GetTypeReference(type, p.ParameterType)}): {paramDescription}");
+                        methodBuilder.AppendLine();
                     }
                     methodBuilder.AppendLine();
                 }
 
-                if (method.ReturnType != typeof(void))
+                if (method.ReturnType.Name != "Void")
                 {
                     methodBuilder.AppendLine("**Returns:**");
 
-                    string returnDescription = !string.IsNullOrWhiteSpace(xmlMethod.Returns)
-                        ? xmlMethod.Returns.Trim()
-                        : "";
+                    // Null safety for return comments
+                    string returnDescription = xmlMethod?.Returns?.Trim() ?? "";
 
-                    methodBuilder.AppendLine($"`{GetTypeReference(type, method.ReturnType)}`: {returnDescription}");
+                    methodBuilder.AppendLine($"{GetTypeReference(type, method.ReturnType)}: {returnDescription}");
                     methodBuilder.AppendLine();
                 }
 
                 methodBuilder.AppendLine("---");
             }
 
-
             string typeKind = "???";
-            if (type.IsEnum)
-            {
-                typeKind = "enum";
-            }
-            else if (type.IsInterface)
-            {
-                typeKind = "interface";
-            }
-            else if (type.IsClass)
-            {
-                typeKind = "class";
-            }
-            else if (type.IsValueType)
-            {
-                typeKind = "struct";
-            }
-            string typeDeclarationModifier = "";
-            if (type.IsAbstract)
-            {
-                typeDeclarationModifier += "abstract ";
-            }
-            if (type.IsSealed)
-            {
-                typeDeclarationModifier += "sealed ";
-            }
+            if (type.IsEnum) typeKind = "enum";
+            else if (type.IsInterface) typeKind = "interface";
+            else if (type.IsClass) typeKind = "class";
+            else if (type.IsValueType) typeKind = "struct";
 
+            string typeDeclarationModifier = "";
+            if (type.IsAbstract && type.IsSealed) typeDeclarationModifier = "static ";
+            else
+            {
+                if (type.IsAbstract && !type.IsInterface) typeDeclarationModifier += "abstract ";
+                if (type.IsSealed && !type.IsValueType) typeDeclarationModifier += "sealed ";
+            }
             List<string> parents = new();
             Type? parent = type.BaseType;
             while (parent is not null)
@@ -201,33 +217,33 @@ public class DocGenerator
             string inheritanceBuilder = parents.Count > 0
                 ? string.Join(" ➔ ", parents) + " ➔ "
                 : "";
+
             string interfaceBuilder = string.Join(", ", type.GetInterfaces().Select(i => GetTypeReference(type, i)));
 
             string template = $""""
                     # {type.Name}
 
-                    {xmlType.Summary}
+                    {typeSummary}
 
                     ## Definition
 
-                    **Namespace:** `{type.Namespace}`  
-                    **Assembly:** `{type.Assembly.FullName}.dll`
+                    **Namespace:** `{type.Namespace ?? "<Global>"}`  
+                    **Assembly:** `{type.Assembly?.FullName?.Split(',')[0]}.dll`
 
                     ```csharp
                     {typeDeclarationModifier}{typeKind} {type.Name}
-
                     ```
+                    {(type.IsEnum ? string.Empty : 
+                       ($""""
+                        **Inheritance:**
 
-                    ## Inheritance & Interfaces
+                        {inheritanceBuilder} **{type.Name}**
 
-                    **Inheritance:**
+                        **Implements:**
 
-                    `{inheritanceBuilder}` ➔ **{type.Name}**
-
-                    **Implements:**
-
-                    `{interfaceBuilder}`
-
+                        {interfaceBuilder}
+                       """"
+                       ))}
                     ---
 
                     ## Fields
@@ -248,15 +264,15 @@ public class DocGenerator
 
                     ## Methods
 
-                   {methodBuilder}
+                    {methodBuilder}
 
                     ---
-"""";
+                    """";
 
             string relativeNamespacePath = type.Namespace?.Replace('.', '/') ?? string.Empty;
-            string finalDirectory = Path.Combine(outputFolder, relativeNamespacePath);
+            string finalDirectory = Path.Combine(rootOutputDirectory, relativeNamespacePath);
             Directory.CreateDirectory(finalDirectory);
-            File.WriteAllText(Path.Combine(finalDirectory, $"{className}.md"), template);
+            File.WriteAllText(Path.Combine(finalDirectory.ToLower(), $"{className.ToLower()}.md"), template);
         }
     }
 }
