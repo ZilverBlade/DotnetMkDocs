@@ -27,8 +27,8 @@ public class DocGenerator
             return $"{targetType.Name.ToLower()}.md";
 
         // Calculate relative path for your own cross-module classes
-        string[] sourceParts = string.IsNullOrEmpty(currentNs) ? Array.Empty<string>() : currentNs.Split('.');
-        string[] targetParts = string.IsNullOrEmpty(targetNs) ? Array.Empty<string>() : targetNs.Split('.');
+        string[] sourceParts = string.IsNullOrEmpty(currentNs) ? Array.Empty<string>() : currentNs.ToLower().Split('.');
+        string[] targetParts = string.IsNullOrEmpty(targetNs) ? Array.Empty<string>() : targetNs.ToLower().Split('.');
 
         int commonCount = 0;
         int minLength = Math.Min(sourceParts.Length, targetParts.Length);
@@ -41,7 +41,7 @@ public class DocGenerator
         int dirsUp = sourceParts.Length - commonCount;
         string upPath = string.Concat(Enumerable.Repeat("../", dirsUp));
 
-        string downPath = string.Join("/", targetParts.Skip(commonCount)).ToLower();
+        string downPath = string.Join("/", targetParts.Skip(commonCount));
         if (!string.IsNullOrEmpty(downPath))
         {
             downPath += "/";
@@ -52,8 +52,8 @@ public class DocGenerator
 
     string GetTypeReference(Type currentType, Type type, bool link = true)
     {
-        if (link && type.IsGenericType) return GetTypeReference(currentType, type, false);
-        var GetElementName = (Type t) => $"{type.Name}{(type.IsNullable() ? "?" : "")}";
+        if (type.IsGenericParameter) return type.Name;
+        var GetElementName = (Type t) => $"{t.Name}{(Nullable.GetUnderlyingType(t) != null ? "?" : "")}";
         if (type.IsByRef)
         {
             return GetTypeReference(currentType, type.GetElementType()!);
@@ -97,6 +97,10 @@ public class DocGenerator
 
         Assembly assembly = context.LoadFromAssemblyPath(dllFilePath);
 
+        BindingFlags declaredFlags = BindingFlags.Public | BindingFlags.NonPublic |
+                             BindingFlags.Instance | BindingFlags.Static |
+                             BindingFlags.DeclaredOnly;
+
         foreach (var type in assembly.ExportedTypes)
         {
             if (!type.IsVisible) continue;
@@ -111,31 +115,84 @@ public class DocGenerator
             StringBuilder propertyBuilder = new();
             StringBuilder methodBuilder = new();
 
-            foreach (var field in type.GetFields())
+            foreach (var field in type.GetFields(declaredFlags))
             {
                 if (field.IsSpecialName) continue;
+                bool isProtected = field.IsFamily || field.IsFamilyOrAssembly;
+                if (field.IsPrivate || field.IsAssembly) continue;
+                if (isProtected && type.IsSealed) continue;
+
                 var xmlField = reader.GetMemberComment(field)?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
                 string modifiers = string.Empty;
                 if (!type.IsEnum)
                 {
-                    if (field.IsPublic) modifiers += "public ";
+                    modifiers = isProtected ? "protected " : "public ";
                     if (field.IsStatic) modifiers += "static ";
+                    if (field.IsInitOnly) modifiers += "readonly ";
                 }
                 fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(type, field.FieldType)} | {xmlField} |");
             }
 
-            foreach (var property in type.GetProperties())
+            foreach (var property in type.GetProperties(declaredFlags))
             {
                 if (property.IsSpecialName) continue;
+
+                var getter = property.GetGetMethod(true);
+                var setter = property.GetSetMethod(true);
+
+                bool isGetterPublic = getter?.IsPublic == true;
+                bool isSetterPublic = setter?.IsPublic == true;
+                bool isGetterProtected = getter?.IsFamily == true || getter?.IsFamilyOrAssembly == true;
+                bool isSetterProtected = setter?.IsFamily == true || setter?.IsFamilyOrAssembly == true;
+
+                bool isPublic = isGetterPublic || isSetterPublic;
+                bool isProtected = isGetterProtected || isSetterProtected;
+
+                // Visibility filtering
+                if (!isPublic && !isProtected) continue; // Hide private/internal
+                if (!isPublic && isProtected && type.IsSealed) continue; // Hide protected if sealed
+
                 var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+
                 string modifiers = string.Empty;
-                propertyBuilder.AppendLine($"|`{modifiers}{property.Name}` | {GetTypeReference(type, property.PropertyType)} | {xmlProperty} |");
+                if (isGetterPublic == isSetterPublic &&
+                    ((getter == null) != (setter == null) || (getter?.IsStatic == setter?.IsStatic)))
+                {
+                    modifiers = isPublic ? "public " : "protected ";
+                    if ((getter?.IsStatic ?? false) || (setter?.IsStatic ?? false)) modifiers += "static ";
+                    if (getter != null) modifiers += "get; ";
+                    if (setter != null) modifiers += "set; ";
+                }
+                else {
+                    var AppendModifiers = (MethodInfo p) =>
+                    {
+                        modifiers += p.IsPublic ? "public " : "protected ";
+                        if (p.IsStatic) modifiers += " static";
+                    };
+                    if (getter != null)
+                    {
+                        AppendModifiers(getter);
+                        modifiers += "get; ";
+                    }
+                    if (setter != null)
+                    {
+                        AppendModifiers(setter);
+                        modifiers += "set; ";
+                    }
+                }
+
+                propertyBuilder.AppendLine($"| `{modifiers}{property.Name}` | {GetTypeReference(type, property.PropertyType)} | {xmlProperty} |");
             }
 
-            foreach (var method in type.GetMethods())
+            foreach (var method in type.GetMethods(declaredFlags))
             {
                 if (method.IsSpecialName) continue;
-                // Null safety for methods
+
+                // Visibility filtering
+                bool isProtected = method.IsFamily || method.IsFamilyOrAssembly;
+                if (method.IsPrivate || method.IsAssembly) continue; // Hide private/internal
+                if (isProtected && type.IsSealed) continue;        // Hide protected if sealed
+
                 var xmlMethod = reader.GetMethodComments(method);
                 var parameters = method.GetParameters();
 
@@ -152,7 +209,19 @@ public class DocGenerator
 
                 string joinedParams = string.Join(", ", paramSignatures);
 
-                methodBuilder.AppendLine($"### {method.Name}({joinedParams})");
+                string methodGenArgs = string.Empty;
+                if (method.IsGenericMethodDefinition)
+                {
+                    var genParams = method.GetGenericArguments().Select(t => t.Name);
+                    methodGenArgs = $"&lt;{string.Join(", ", genParams)}&gt;";
+                }
+
+                string modifiers = isProtected ? "protected " : "public ";
+                if (method.IsStatic) modifiers += "static ";
+                else if (method.IsAbstract && !type.IsInterface) modifiers += "abstract ";
+                else if (method.IsVirtual && !method.IsFinal && !type.IsInterface) modifiers += "virtual ";
+
+                methodBuilder.AppendLine($"#### {modifiers}{GetTypeReference(type, method.ReturnType)} {method.Name}{methodGenArgs}({joinedParams})");
                 methodBuilder.AppendLine();
 
                 string methodSummary = xmlMethod?.Summary?.Replace("\n", " ").Trim() ?? "";
@@ -165,6 +234,7 @@ public class DocGenerator
                 if (parameters.Length > 0)
                 {
                     methodBuilder.AppendLine("**Parameters:**");
+                    methodBuilder.AppendLine();
 
                     foreach (var p in parameters)
                     {
@@ -181,11 +251,12 @@ public class DocGenerator
                 if (method.ReturnType.Name != "Void")
                 {
                     methodBuilder.AppendLine("**Returns:**");
+                    methodBuilder.AppendLine();
 
                     // Null safety for return comments
                     string returnDescription = xmlMethod?.Returns?.Trim() ?? "";
 
-                    methodBuilder.AppendLine($"{GetTypeReference(type, method.ReturnType)}: {returnDescription}");
+                    methodBuilder.AppendLine($"- {GetTypeReference(type, method.ReturnType)}: {returnDescription}");
                     methodBuilder.AppendLine();
                 }
 
@@ -233,15 +304,15 @@ public class DocGenerator
                     ```csharp
                     {typeDeclarationModifier}{typeKind} {type.Name}
                     ```
-                    {(type.IsEnum ? string.Empty : 
+                    {(type.IsEnum ? string.Empty :
                        ($""""
-                        **Inheritance:**
+                       **Inheritance:**
 
-                        {inheritanceBuilder} **{type.Name}**
+                       ##### {inheritanceBuilder} **{type.Name}**
 
-                        **Implements:**
+                       **Implements:**
 
-                        {interfaceBuilder}
+                       ##### {interfaceBuilder}
                        """"
                        ))}
                     ---
@@ -270,9 +341,9 @@ public class DocGenerator
                     """";
 
             string relativeNamespacePath = type.Namespace?.Replace('.', '/') ?? string.Empty;
-            string finalDirectory = Path.Combine(rootOutputDirectory, relativeNamespacePath);
+            string finalDirectory = Path.Combine(rootOutputDirectory, relativeNamespacePath.ToLower());
             Directory.CreateDirectory(finalDirectory);
-            File.WriteAllText(Path.Combine(finalDirectory.ToLower(), $"{className.ToLower()}.md"), template);
+            File.WriteAllText(Path.Combine(finalDirectory, $"{className.ToLower()}.md"), template);
         }
     }
 }
