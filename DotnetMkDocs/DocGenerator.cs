@@ -117,6 +117,7 @@ public class DocGenerator
         BindingFlags declaredFlags = BindingFlags.Public | BindingFlags.NonPublic |
                              BindingFlags.Instance | BindingFlags.Static |
                              BindingFlags.DeclaredOnly;
+        var namespaceGroups = new Dictionary<string, List<(Type Type, string Summary)>>();
 
         foreach (var type in assembly.ExportedTypes)
         {
@@ -127,6 +128,10 @@ public class DocGenerator
             // Null safety for type comments
             var xmlType = reader.GetTypeComments(type);
             string typeSummary = xmlType?.Summary?.Trim() ?? "";
+
+            string nsKey = type.Namespace ?? string.Empty;
+            if (!namespaceGroups.ContainsKey(nsKey)) namespaceGroups[nsKey] = new();
+            namespaceGroups[nsKey].Add((type, typeSummary));
 
             StringBuilder fieldBuilder = new();
             StringBuilder propertyBuilder = new();
@@ -368,5 +373,46 @@ public class DocGenerator
             Directory.CreateDirectory(finalDirectory);
             File.WriteAllText(Path.Combine(finalDirectory, $"{className.ToLower()}.md"), template);
         }
+
+        StringBuilder indexBuilder = new StringBuilder();
+        indexBuilder.AppendLine($"# {assemblyName}");
+        indexBuilder.AppendLine();
+        indexBuilder.AppendLine("## Namespaces");
+        indexBuilder.AppendLine();
+
+        foreach (var kvp in namespaceGroups.OrderBy(x => x.Key))
+        {
+            string nsName = string.IsNullOrEmpty(kvp.Key) ? "<Global>" : kvp.Key;
+            indexBuilder.AppendLine($"### `{nsName}`");
+            indexBuilder.AppendLine();
+            indexBuilder.AppendLine("| Type | Description |");
+            indexBuilder.AppendLine("| --- | --- |");
+
+            foreach (var t in kvp.Value.OrderBy(x => x.Type.Name))
+            {
+                string cleanSummary = t.Summary.Replace("\n", " ").Replace("|", "\\|").Trim();
+
+                string relativeNamespacePath = t.Type.Namespace?.Replace('.', '/') ?? string.Empty;
+                string fileName = $"{t.Type.Name.ToLower()}.md";
+                string linkPath = string.IsNullOrEmpty(relativeNamespacePath)
+                    ? $"./{fileName}"
+                    : $"./{relativeNamespacePath}/{fileName}".ToLower();
+
+                string displayName = t.Type.Name;
+                if (t.Type.IsGenericType)
+                {
+                    int backtick = displayName.IndexOf('`');
+                    if (backtick > 0) displayName = displayName.Substring(0, backtick);
+
+                    var genArgs = string.Join(", ", t.Type.GetGenericArguments().Select(g => g.Name));
+                    displayName = $"{displayName}&lt;{genArgs}&gt;";
+                }
+
+                indexBuilder.AppendLine($"| [{displayName}]({linkPath}) | {cleanSummary} |");
+            }
+            indexBuilder.AppendLine();
+        }
+
+        File.WriteAllText(Path.Combine(rootOutputDirectory, "index.md"), indexBuilder.ToString());
     }
 }
