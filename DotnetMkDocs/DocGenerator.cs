@@ -50,34 +50,51 @@ public class DocGenerator
         return $"{upPath}{downPath}{targetType.Name.ToLower()}.md";
     }
 
-    string GetTypeReference(Type currentType, Type type, bool link = true)
+    string GetTypeReference(NullabilityInfo? nullabilityInfo, Type currentType, Type type, bool link = true)
     {
         if (type.IsGenericParameter) return type.Name;
-        var GetElementName = (Type t) => $"{t.Name}{(Nullable.GetUnderlyingType(t) != null ? "?" : "")}";
+
+        string append = "";
+        if (nullabilityInfo?.WriteState == NullabilityState.Nullable)
+        {
+            append = "?";
+        }
+        else
+        {
+            Type? nullableUnderlying = Nullable.GetUnderlyingType(type);
+            if (nullableUnderlying != null)
+            {
+                append = "?";
+                type = nullableUnderlying;
+            }
+        }
+
         if (type.IsByRef)
         {
-            return GetTypeReference(currentType, type.GetElementType()!);
+            return GetTypeReference(nullabilityInfo, currentType, type.GetElementType()!, link);
         }
         else if (type.IsArray)
         {
             var elementType = type.GetElementType()!;
-            string nolink0 = $"{GetElementName(elementType)}[]";
+            string nolink0 = $"{GetTypeReference(nullabilityInfo, currentType, elementType, false)}[]{append}";
             if (link) return $"[{nolink0}]({GetTypeReferenceCanonical(currentType, elementType)})";
             else return nolink0;
         }
         else if (type.IsGenericTypeDefinition || type.IsGenericType)
         {
-            var genericArgs = string.Join(", ", type.GenericTypeArguments.Select(g => GetTypeReference(currentType, g, false)));
+            var genericArgs = string.Join(", ", type.GenericTypeArguments.Select(g => GetTypeReference(nullabilityInfo, currentType, g, false)));
 
             // Safety check: ensure the backtick actually exists before substringing
             int backtickIndex = type.Name.IndexOf('`');
             string cleanName = backtickIndex >= 0 ? type.Name.Substring(0, backtickIndex) : type.Name;
 
-            string nolink1 = $"{cleanName}&lt;{genericArgs}&gt;";
+            string nolink1 = $"{cleanName}&lt;{genericArgs}&gt;{append}";
             if (link) return $"[{nolink1}]({GetTypeReferenceCanonical(currentType, type)})";
             else return nolink1;
         }
-        string nolink = $"{GetElementName(type)}";
+
+        // Standard types
+        string nolink = $"{type.Name}{append}";
         if (link) return $"[{nolink}]({GetTypeReferenceCanonical(currentType, type)})";
         else return nolink;
     }
@@ -122,7 +139,7 @@ public class DocGenerator
                 if (field.IsPrivate || field.IsAssembly) continue;
                 if (isProtected && type.IsSealed) continue;
 
-                var xmlField = reader.GetMemberComment(field)?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+                var xmlField = reader.GetMemberComment(field)?.Replace("\n", " ").Replace("<br>", " ").Replace("|", "\\|").Trim() ?? "";
                 string modifiers = string.Empty;
                 if (!type.IsEnum)
                 {
@@ -130,7 +147,8 @@ public class DocGenerator
                     if (field.IsStatic) modifiers += "static ";
                     if (field.IsInitOnly) modifiers += "readonly ";
                 }
-                fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(type, field.FieldType)} | {xmlField} |");
+                var nullabilityInfo = new NullabilityInfoContext().Create(field);
+                fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(nullabilityInfo, type, field.FieldType)} | {xmlField} |");
             }
 
             foreach (var property in type.GetProperties(declaredFlags))
@@ -152,7 +170,7 @@ public class DocGenerator
                 if (!isPublic && !isProtected) continue; // Hide private/internal
                 if (!isPublic && isProtected && type.IsSealed) continue; // Hide protected if sealed
 
-                var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+                var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("<br>", " ").Replace("|", "\\|").Trim() ?? "";
 
                 string modifiers = string.Empty;
                 if (isGetterPublic == isSetterPublic &&
@@ -163,7 +181,8 @@ public class DocGenerator
                     if (getter != null) modifiers += "get; ";
                     if (setter != null) modifiers += "set; ";
                 }
-                else {
+                else
+                {
                     var AppendModifiers = (MethodInfo p) =>
                     {
                         modifiers += p.IsPublic ? "public " : "protected ";
@@ -181,7 +200,8 @@ public class DocGenerator
                     }
                 }
 
-                propertyBuilder.AppendLine($"| `{modifiers}{property.Name}` | {GetTypeReference(type, property.PropertyType)} | {xmlProperty} |");
+                var nullabilityInfo = new NullabilityInfoContext().Create(property);
+                propertyBuilder.AppendLine($"| `{modifiers}{property.Name}` | {GetTypeReference(nullabilityInfo, type, property.PropertyType)} | {xmlProperty} |");
             }
 
             foreach (var method in type.GetMethods(declaredFlags))
@@ -205,7 +225,7 @@ public class DocGenerator
                 };
 
                 var paramSignatures = parameters.Select(p =>
-                    $"{GetParamModifiers(p)}{GetTypeReference(type, p.ParameterType)} {p.Name}");
+                    $"{GetParamModifiers(p)}{GetTypeReference(new NullabilityInfoContext().Create(p), type, p.ParameterType)} {p.Name}");
 
                 string joinedParams = string.Join(", ", paramSignatures);
 
@@ -221,7 +241,9 @@ public class DocGenerator
                 else if (method.IsAbstract && !type.IsInterface) modifiers += "abstract ";
                 else if (method.IsVirtual && !method.IsFinal && !type.IsInterface) modifiers += "virtual ";
 
-                methodBuilder.AppendLine($"#### {modifiers}{GetTypeReference(type, method.ReturnType)} {method.Name}{methodGenArgs}({joinedParams})");
+                methodBuilder.AppendLine($"#### {modifiers}" +
+                    $"{GetTypeReference(new NullabilityInfoContext().Create(method.ReturnParameter), type, method.ReturnType)} " +
+                    $"{method.Name}{methodGenArgs}({joinedParams})");
                 methodBuilder.AppendLine();
 
                 string methodSummary = xmlMethod?.Summary?.Replace("\n", " ").Trim() ?? "";
@@ -242,7 +264,7 @@ public class DocGenerator
                         var xmlParam = xmlMethod?.Parameters?.FirstOrDefault(x => x.Name == p.Name);
                         string paramDescription = xmlParam?.Text?.Trim() ?? "";
 
-                        methodBuilder.AppendLine($"- `{p.Name}` ({GetTypeReference(type, p.ParameterType)}): {paramDescription}");
+                        methodBuilder.AppendLine($"- `{p.Name}` ({GetTypeReference(new NullabilityInfoContext().Create(p), type, p.ParameterType)}): {paramDescription}");
                         methodBuilder.AppendLine();
                     }
                     methodBuilder.AppendLine();
@@ -256,7 +278,8 @@ public class DocGenerator
                     // Null safety for return comments
                     string returnDescription = xmlMethod?.Returns?.Trim() ?? "";
 
-                    methodBuilder.AppendLine($"- {GetTypeReference(type, method.ReturnType)}: {returnDescription}");
+                    methodBuilder.AppendLine($"- {GetTypeReference(new NullabilityInfoContext().Create(method.ReturnParameter),
+                        type, method.ReturnType)}: {returnDescription}");
                     methodBuilder.AppendLine();
                 }
 
@@ -280,7 +303,7 @@ public class DocGenerator
             Type? parent = type.BaseType;
             while (parent is not null)
             {
-                parents.Add(GetTypeReference(type, parent));
+                parents.Add(GetTypeReference(null, type, parent));
                 parent = parent.BaseType;
             }
             parents.Reverse();
@@ -289,7 +312,7 @@ public class DocGenerator
                 ? string.Join(" ➔ ", parents) + " ➔ "
                 : "";
 
-            string interfaceBuilder = string.Join(", ", type.GetInterfaces().Select(i => GetTypeReference(type, i)));
+            string interfaceBuilder = string.Join(", ", type.GetInterfaces().Select(i => GetTypeReference(null, type, i)));
 
             string template = $""""
                     # {type.Name}
