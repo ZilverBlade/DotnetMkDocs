@@ -8,23 +8,33 @@ namespace DotnetMkDocs;
 
 public class DocGenerator
 {
-    private string[] GetNamespaceParts(string ns)
+    public class NavNode
+    {
+        public string Name { get; set; } = string.Empty;
+        public Dictionary<string, NavNode> Folders { get; } = new();
+        public List<(string Title, string Path)> Pages { get; } = new();
+    }
+    private readonly NavNode _rootNav = new NavNode { Name = "API Reference" };
+    private string[] GetNamespaceParts(string owningAssemblyName, string ns, bool tolower)
     {
         if (string.IsNullOrEmpty(ns)) return Array.Empty<string>();
 
         string[] rawParts = ns.Split('.');
 
-        // If it's your project structure, bundle the first 3 parts as the root assembly folder
-        if (rawParts.Length >= 3 && rawParts[0] == "SDT4" && rawParts[1] == "Managed")
+        if (!string.IsNullOrEmpty(owningAssemblyName) && ns.StartsWith(owningAssemblyName))
         {
-            string rootAsm = $"{rawParts[0]}.{rawParts[1]}.{rawParts[2]}";
-            var parts = new List<string> { rootAsm };
-            if (rawParts.Length > 3) parts.AddRange(rawParts.Skip(3).Select(p => p.ToLower()));
-            return parts.ToArray();
+            var parts = new List<string> { owningAssemblyName };
+
+            string remainder = ns.Substring(owningAssemblyName.Length).TrimStart('.');
+            if (!string.IsNullOrEmpty(remainder))
+            {
+                parts.AddRange(remainder.Split('.'));
+            }
+            return (tolower ? parts.Select(s => s.ToLower()) : parts).ToArray();
         }
 
-        // Fallback for any other random namespaces
-        return rawParts.Select(p => p.ToLower()).ToArray();
+        // Fallback for completely external namespaces
+        return (tolower ? ns.ToLower() : ns).Split('.');
     }
 
     string GetTypeReferenceCanonical(Type currentType, Type targetType)
@@ -42,8 +52,10 @@ public class DocGenerator
         if (currentNs == targetNs)
             return $"./{targetType.Name.ToLower()}.md";
 
-        string[] sourceParts = GetNamespaceParts(currentNs);
-        string[] targetParts = GetNamespaceParts(targetNs);
+        string sourceAsm = currentType.Assembly.GetName().Name ?? string.Empty;
+        string targetAsm = targetType.Assembly.GetName().Name ?? string.Empty;
+        string[] sourceParts = GetNamespaceParts(sourceAsm, currentNs, true);
+        string[] targetParts = GetNamespaceParts(targetAsm, targetNs, true);
 
         int commonCount = 0;
         int minLength = Math.Min(sourceParts.Length, targetParts.Length);
@@ -89,8 +101,10 @@ public class DocGenerator
         {
             var elementType = type.GetElementType()!;
             string nolink0 = $"{GetTypeReference(nullabilityInfo, currentType, elementType, false)}[]{append}";
-            if (link) return $"[{nolink0}]({GetTypeReferenceCanonical(currentType, elementType)})";
-            else return nolink0;
+            if (link && !elementType.IsGenericParameter)
+                return $"[{nolink0}]({GetTypeReferenceCanonical(currentType, elementType)})";
+            else
+                return nolink0;
         }
         else if (type.IsGenericTypeDefinition || type.IsGenericType)
         {
@@ -199,7 +213,7 @@ public class DocGenerator
                     var AppendModifiers = (MethodInfo p) =>
                     {
                         modifiers += p.IsPublic ? "public " : "protected ";
-                        if (p.IsStatic) modifiers += " static";
+                        if (p.IsStatic) modifiers += "static ";
                     };
                     if (getter != null) { AppendModifiers(getter); modifiers += "get; "; }
                     if (setter != null) { AppendModifiers(setter); modifiers += "set; "; }
@@ -312,8 +326,10 @@ public class DocGenerator
 
             string interfaceBuilder = string.Join(", ", type.GetInterfaces().Select(i => GetTypeReference(null, type, i)));
 
+            string typeNamePretty = GetTypeReference(null, type, type, false);
+
             string template = $""""
-                    # {type.Name}
+                    # {typeNamePretty}
 
                     {typeSummary}
 
@@ -323,14 +339,16 @@ public class DocGenerator
                     **Assembly:** `{type.Assembly?.FullName?.Split(',')[0]}.dll`
 
                     ```csharp
-                    {typeDeclarationModifier}{typeKind} {type.Name}
+                    {typeDeclarationModifier}{typeKind} {typeNamePretty.Replace("&lt;", "<").Replace("&gt;", ">")}
                     ```
                     {(type.IsEnum ? string.Empty :
-                       ($""""
+                       (((type.IsValueType || type.IsInterface) ? string.Empty : $""""
                        **Inheritance:**
 
-                       ##### {inheritanceBuilder} **{type.Name}**
-
+                       ##### {inheritanceBuilder} **{typeNamePretty}**
+                       
+                       """") +
+                       $""""
                        **Implements:**
 
                        ##### {interfaceBuilder}
@@ -361,7 +379,7 @@ public class DocGenerator
                     ---
                     """";
 
-            string[] nsParts = GetNamespaceParts(type.Namespace ?? string.Empty);
+            string[] nsParts = GetNamespaceParts(assemblyName, type.Namespace ?? string.Empty, true);
             string finalDirectory = Path.Combine(rootOutputDirectory, string.Join("/", nsParts));
             Directory.CreateDirectory(finalDirectory);
             File.WriteAllText(Path.Combine(finalDirectory, $"{className.ToLower()}.md"), template);
@@ -373,7 +391,7 @@ public class DocGenerator
         indexBuilder.AppendLine("## Namespaces");
         indexBuilder.AppendLine();
 
-        string[] sourceNsParts = GetNamespaceParts(assemblyName); // The index.md lives at the root folder of the assembly
+        string[] sourceNsParts = GetNamespaceParts(assemblyName, assemblyName, true); // The index.md lives at the root folder of the assembly
 
         foreach (var kvp in namespaceGroups.OrderBy(x => x.Key))
         {
@@ -387,7 +405,7 @@ public class DocGenerator
             {
                 string cleanSummary = t.Summary.Replace("\n", " ").Replace("|", "\\|").Trim();
 
-                string[] targetNsParts = GetNamespaceParts(t.Type.Namespace ?? string.Empty);
+                string[] targetNsParts = GetNamespaceParts(assemblyName, t.Type.Namespace ?? string.Empty, true);
 
                 // Calculate relative path from the root index.md down into the subfolders
                 int commonCount = 0;
@@ -419,5 +437,69 @@ public class DocGenerator
         string assemblyFolder = Path.Combine(rootOutputDirectory, assemblyName);
         Directory.CreateDirectory(assemblyFolder);
         File.WriteAllText(Path.Combine(assemblyFolder, "index.md"), indexBuilder.ToString());
+
+        string[] asmParts = GetNamespaceParts(assemblyName, assemblyName, false);
+        NavNode asmNode = _rootNav;
+        foreach (var part in asmParts)
+        {
+            if (!asmNode.Folders.ContainsKey(part)) asmNode.Folders[part] = new NavNode { Name = part };
+            asmNode = asmNode.Folders[part];
+        }
+
+        // Add the assembly root index
+        asmNode.Pages.Add(("Overview", $"{assemblyName}/index.md"));
+
+        // Add all the types into their respective folders
+        foreach (var kvp in namespaceGroups)
+        {
+            foreach (var t in kvp.Value)
+            {
+                string[] parts = GetNamespaceParts(t.Type.Assembly.GetName().Name ?? string.Empty, t.Type.Namespace ?? string.Empty, false);
+                NavNode node = _rootNav;
+                foreach (var part in parts)
+                {
+                    if (!node.Folders.ContainsKey(part)) node.Folders[part] = new NavNode { Name = part };
+                    node = node.Folders[part];
+                }
+
+                string filePath = string.Join("/", parts) + $"/{t.Type.Name.ToLower()}.md";
+
+                string displayName = t.Type.Name;
+                if (t.Type.IsGenericType)
+                {
+                    int backtick = displayName.IndexOf('`');
+                    if (backtick > 0) displayName = displayName.Substring(0, backtick);
+                    var genArgs = string.Join(", ", t.Type.GetGenericArguments().Select(g => g.Name));
+                    displayName = $"{displayName}<{genArgs}>";
+                }
+
+                node.Pages.Add((displayName, filePath));
+            }
+        }
+    }
+    public void ExportNavYaml(string outputPath, string prefixPath = "api-reference/")
+    {
+        StringBuilder sb = new StringBuilder();
+
+        // Recursively build the YAML
+        void WriteNode(NavNode node, int indentLevel)
+        {
+            string indent = new string(' ', indentLevel * 2);
+
+            // Put 'Overview' index.md at the top, then sort the rest alphabetically
+            foreach (var page in node.Pages.OrderBy(x => x.Title == "Overview" ? 0 : 1).ThenBy(x => x.Title))
+            {
+                sb.AppendLine($"{indent}- \"{page.Title.Replace("<", "&lt;").Replace(">", "&gt;")}\": {prefixPath.ToLower()}{page.Path.ToLower()}");
+            }
+
+            foreach (var folder in node.Folders.OrderBy(x => x.Key))
+            {
+                sb.AppendLine($"{indent}- {folder.Key}:");
+                WriteNode(folder.Value, indentLevel + 1);
+            }
+        }
+
+        WriteNode(_rootNav, 0); // Start with 0 indent so you can easily copy-paste it
+        File.WriteAllText(outputPath, sb.ToString());
     }
 }

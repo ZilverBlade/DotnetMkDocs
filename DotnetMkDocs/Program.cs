@@ -55,6 +55,10 @@ public static class Program
             Console.WriteLine("------------------------------------------------");
         }
 
+        string finalYamlPath = Path.Combine(Path.GetDirectoryName(args[0])!, "docs", "nav-snippet.yml");
+        generator.ExportNavYaml(finalYamlPath, "api/");
+
+        Console.WriteLine($"\nNavigation YAML generated at: {finalYamlPath}");
         Console.WriteLine("\nAll processing complete. Press any key to close this window...");
         Console.ReadKey();
     }
