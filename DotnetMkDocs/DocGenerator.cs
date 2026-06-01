@@ -1,8 +1,7 @@
-﻿using DocXml.Reflection;
-using LoxSmoke.DocXml;
+﻿using LoxSmoke.DocXml;
 using System.Reflection;
-using System.Runtime.Loader;
 using System.Text;
+using System.Xml.Linq;
 
 namespace DotnetMkDocs;
 
@@ -123,7 +122,26 @@ public class DocGenerator
         else return nolink;
     }
 
-    public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string assemblyName, string rootOutputDirectory)
+public static string ExtractTag(string xmlComment, string tagName)
+{
+    if (string.IsNullOrWhiteSpace(xmlComment)) return string.Empty;
+
+    try
+    {
+        // Wrap the raw comment in a root <doc> element to ensure it's valid, parseable XML
+        var doc = XElement.Parse($"<doc>{xmlComment}</doc>");
+        var node = doc.Element(tagName);
+
+        // .Value gets the inner text, stripping out any nested HTML/XML tags
+        return node?.Value.Trim() ?? string.Empty;
+    }
+    catch (System.Xml.XmlException)
+    {
+        // Failsafe in case the XML comment is completely malformed
+        return string.Empty;
+    }
+}
+public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string assemblyName, string rootOutputDirectory)
     {
         Directory.CreateDirectory(rootOutputDirectory);
 
@@ -152,6 +170,7 @@ public class DocGenerator
 
             var xmlType = reader.GetTypeComments(type);
             string typeSummary = xmlType?.Summary?.Trim() ?? "";
+            string? typeRemarks = xmlType?.Remarks?.Trim();
 
             string nsKey = type.Namespace ?? string.Empty;
             if (!namespaceGroups.ContainsKey(nsKey)) namespaceGroups[nsKey] = new();
@@ -160,6 +179,8 @@ public class DocGenerator
             StringBuilder fieldBuilder = new();
             StringBuilder propertyBuilder = new();
             StringBuilder methodBuilder = new();
+            StringBuilder fieldRemarksBuilder = new();
+            StringBuilder propertyRemarksBuilder = new();
 
             foreach (var field in type.GetFields(declaredFlags))
             {
@@ -168,7 +189,6 @@ public class DocGenerator
                 if (field.IsPrivate || field.IsAssembly) continue;
                 if (isProtected && type.IsSealed) continue;
 
-                var xmlField = reader.GetMemberComment(field)?.Replace("\n", " ").Replace("<br>", " ").Replace("|", "\\|").Trim() ?? "";
                 string modifiers = string.Empty;
                 if (!type.IsEnum)
                 {
@@ -176,8 +196,17 @@ public class DocGenerator
                     if (field.IsStatic) modifiers += "static ";
                     if (field.IsInitOnly) modifiers += "readonly ";
                 }
+
+                var xmlComment = reader.GetMemberComment(field) ?? "";
+                string summary = ExtractTag(xmlComment, "summary").Replace("\n", " ").Replace("|", "\\|").Trim();
+                string remarks = ExtractTag(xmlComment, "remarks").Trim();
                 var nullabilityInfo = new NullabilityInfoContext().Create(field);
-                fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(nullabilityInfo, type, field.FieldType)} | {xmlField} |");
+                fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(nullabilityInfo, type, field.FieldType)} | {summary} |");
+
+                if (!string.IsNullOrEmpty(remarks))
+                {
+                    fieldRemarksBuilder.AppendLine($"##### `{field.Name}` Remarks\n{remarks}\n");
+                }
             }
 
             foreach (var property in type.GetProperties(declaredFlags))
@@ -197,7 +226,6 @@ public class DocGenerator
 
                 if (!isPublic && !isProtected) continue;
                 if (!isPublic && isProtected && type.IsSealed) continue;
-                var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("<br>", " ").Replace("|", "\\|").Trim() ?? "";
 
                 string modifiers = string.Empty;
                 if (isGetterPublic == isSetterPublic &&
@@ -218,9 +246,17 @@ public class DocGenerator
                     if (getter != null) { AppendModifiers(getter); modifiers += "get; "; }
                     if (setter != null) { AppendModifiers(setter); modifiers += "set; "; }
                 }
+                var xmlComment = reader.GetMemberComment(property) ?? "";
+                string summary = ExtractTag(xmlComment, "summary").Replace("\n", " ").Replace("|", "\\|").Trim();
+                string remarks = ExtractTag(xmlComment, "remarks").Trim();
 
                 var nullabilityInfo = new NullabilityInfoContext().Create(property);
-                propertyBuilder.AppendLine($"| `{modifiers}{property.Name}` | {GetTypeReference(nullabilityInfo, type, property.PropertyType)} | {xmlProperty} |");
+                propertyBuilder.AppendLine($"| `{modifiers}{property.Name}` | {GetTypeReference(nullabilityInfo, type, property.PropertyType)} | {summary} |");
+
+                if (!string.IsNullOrEmpty(remarks))
+                {
+                    propertyRemarksBuilder.AppendLine($"##### `{property.Name}` Remarks\n{remarks}\n");
+                }
             }
 
             foreach (var method in type.GetMethods(declaredFlags))
@@ -264,10 +300,18 @@ public class DocGenerator
                     $"{method.Name}{methodGenArgs}({joinedParams})");
                 methodBuilder.AppendLine();
 
-                string methodSummary = xmlMethod?.Summary?.Replace("\n", " ").Trim() ?? "";
+                string? methodSummary = xmlMethod?.Summary;
                 if (!string.IsNullOrWhiteSpace(methodSummary))
                 {
+                    methodBuilder.AppendLine("##### Summary");
                     methodBuilder.AppendLine(methodSummary);
+                    methodBuilder.AppendLine();
+                }
+                string? methodRemarks= xmlMethod?.Remarks;
+                if (!string.IsNullOrWhiteSpace(methodRemarks))
+                {
+                    methodBuilder.AppendLine("##### Remarks");
+                    methodBuilder.AppendLine(methodRemarks);
                     methodBuilder.AppendLine();
                 }
 
@@ -330,8 +374,11 @@ public class DocGenerator
 
             string template = $""""
                     # {typeNamePretty}
-
+                    
+                    ## Summary
                     {typeSummary}
+
+                    {(!string.IsNullOrWhiteSpace(typeRemarks)? $"## Remarks\n{typeRemarks!}" : string.Empty)}
 
                     ## Definition
 
@@ -361,16 +408,16 @@ public class DocGenerator
                     | Name | Type | Description |
                     | --- | --- | --- |
                     {fieldBuilder}
-
                     ---
+                    {fieldRemarksBuilder}
 
                     ## Properties
 
                     | Name | Type | Description |
                     | --- | --- | --- |
                     {propertyBuilder}
-
                     ---
+                    {propertyRemarksBuilder}
 
                     ## Methods
 
@@ -434,7 +481,7 @@ public class DocGenerator
         }
 
         // SAVE THE INDEX FILE AT THE ROOT OF THE ASSEMBLY FOLDER
-        string assemblyFolder = Path.Combine(rootOutputDirectory, assemblyName);
+        string assemblyFolder = Path.Combine(rootOutputDirectory, assemblyName.ToLower());
         Directory.CreateDirectory(assemblyFolder);
         File.WriteAllText(Path.Combine(assemblyFolder, "index.md"), indexBuilder.ToString());
 
