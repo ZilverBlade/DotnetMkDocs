@@ -122,26 +122,7 @@ public class DocGenerator
         else return nolink;
     }
 
-public static string ExtractTag(string xmlComment, string tagName)
-{
-    if (string.IsNullOrWhiteSpace(xmlComment)) return string.Empty;
-
-    try
-    {
-        // Wrap the raw comment in a root <doc> element to ensure it's valid, parseable XML
-        var doc = XElement.Parse($"<doc>{xmlComment}</doc>");
-        var node = doc.Element(tagName);
-
-        // .Value gets the inner text, stripping out any nested HTML/XML tags
-        return node?.Value.Trim() ?? string.Empty;
-    }
-    catch (System.Xml.XmlException)
-    {
-        // Failsafe in case the XML comment is completely malformed
-        return string.Empty;
-    }
-}
-public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string assemblyName, string rootOutputDirectory)
+    public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string assemblyName, string rootOutputDirectory)
     {
         Directory.CreateDirectory(rootOutputDirectory);
 
@@ -197,9 +178,9 @@ public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string a
                     if (field.IsInitOnly) modifiers += "readonly ";
                 }
 
-                var xmlComment = reader.GetMemberComment(field) ?? "";
-                string summary = ExtractTag(xmlComment, "summary").Replace("\n", " ").Replace("|", "\\|").Trim();
-                string remarks = ExtractTag(xmlComment, "remarks").Trim();
+                var xmlField = reader.GetMemberComments(field);
+                string summary = xmlField?.Summary?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+                string? remarks = xmlField?.Remarks?.Trim();
                 var nullabilityInfo = new NullabilityInfoContext().Create(field);
                 fieldBuilder.AppendLine($"| `{modifiers}{field.Name}` | {GetTypeReference(nullabilityInfo, type, field.FieldType)} | {summary} |");
 
@@ -246,9 +227,9 @@ public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string a
                     if (getter != null) { AppendModifiers(getter); modifiers += "get; "; }
                     if (setter != null) { AppendModifiers(setter); modifiers += "set; "; }
                 }
-                var xmlComment = reader.GetMemberComment(property) ?? "";
-                string summary = ExtractTag(xmlComment, "summary").Replace("\n", " ").Replace("|", "\\|").Trim();
-                string remarks = ExtractTag(xmlComment, "remarks").Trim();
+                var xmlProperty = reader.GetMemberComments(property);
+                string summary = xmlProperty?.Summary?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+                string? remarks = xmlProperty?.Remarks?.Trim();
 
                 var nullabilityInfo = new NullabilityInfoContext().Create(property);
                 propertyBuilder.AppendLine($"| `{modifiers}{property.Name}` | {GetTypeReference(nullabilityInfo, type, property.PropertyType)} | {summary} |");
@@ -307,7 +288,7 @@ public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string a
                     methodBuilder.AppendLine(methodSummary);
                     methodBuilder.AppendLine();
                 }
-                string? methodRemarks= xmlMethod?.Remarks;
+                string? methodRemarks = xmlMethod?.Remarks;
                 if (!string.IsNullOrWhiteSpace(methodRemarks))
                 {
                     methodBuilder.AppendLine("##### Remarks");
@@ -378,7 +359,7 @@ public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string a
                     ## Summary
                     {typeSummary}
 
-                    {(!string.IsNullOrWhiteSpace(typeRemarks)? $"## Remarks\n{typeRemarks!}" : string.Empty)}
+                    {(!string.IsNullOrWhiteSpace(typeRemarks) ? $"## Remarks\n{typeRemarks!}" : string.Empty)}
 
                     ## Definition
 
