@@ -1,7 +1,5 @@
-﻿using DocXml.Reflection;
-using LoxSmoke.DocXml;
+﻿using LoxSmoke.DocXml;
 using System.Reflection;
-using System.Runtime.Loader;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -177,8 +175,10 @@ public class DocGenerator
                 {
                     string link = GetTypeReferenceCanonical(currentType, targetType);
                     // Links directly to the type file, hitting the Markdown anchor tag for the member
-                    return $"[{GetTypeReference(null, currentType, targetType, false)}.{memberName}]({link}#{memberName.ToLower()})";
+                    return
+                        $"[{GetTypeReference(null, currentType, targetType, false)}.{memberName}]({link}#{memberName.ToLower()})";
                 }
+
                 // fallback
                 return $"`{memberName}`";
             }
@@ -219,6 +219,7 @@ public class DocGenerator
 
             var xmlType = reader.GetTypeComments(type);
             string typeSummary = xmlType?.Summary?.Trim() ?? "";
+            string? typeRemarks = xmlType?.Remarks?.Trim();
 
             string nsKey = type.Namespace ?? string.Empty;
             if (!namespaceGroups.ContainsKey(nsKey)) namespaceGroups[nsKey] = new();
@@ -227,6 +228,8 @@ public class DocGenerator
             StringBuilder fieldBuilder = new();
             StringBuilder propertyBuilder = new();
             StringBuilder methodBuilder = new();
+            StringBuilder fieldRemarksBuilder = new();
+            StringBuilder propertyRemarksBuilder = new();
 
             foreach (var field in type.GetFields(declaredFlags))
             {
@@ -235,8 +238,6 @@ public class DocGenerator
                 if (field.IsPrivate || field.IsAssembly) continue;
                 if (isProtected && type.IsSealed) continue;
 
-                var xmlField = reader.GetMemberComment(field)?.Replace("\n", " ").Replace("<br>", " ")
-                    .Replace("|", "\\|").Trim() ?? "";
                 string modifiers = string.Empty;
                 if (!type.IsEnum)
                 {
@@ -245,9 +246,18 @@ public class DocGenerator
                     if (field.IsInitOnly) modifiers += "readonly ";
                 }
 
+                var xmlField = reader.GetMemberComments(field);
+                string summary = xmlField?.Summary?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+                string? remarks = xmlField?.Remarks?.Trim();
                 var nullabilityInfo = new NullabilityInfoContext().Create(field);
                 fieldBuilder.AppendLine(
-                    $"| `{modifiers}{field.Name}` | {GetTypeReference(nullabilityInfo, type, field.FieldType)} | {ResolveInlineTags(xmlField, type, context)} |");
+                    $"| `{modifiers}{field.Name}` | {GetTypeReference(nullabilityInfo, type, field.FieldType)} | {ResolveInlineTags(summary, type, context)} |");
+
+                if (!string.IsNullOrEmpty(remarks))
+                {
+                    fieldRemarksBuilder.AppendLine(
+                        $"##### `{field.Name}` Remarks\n{ResolveInlineTags(remarks, type, context)}\n");
+                }
             }
 
             foreach (var property in type.GetProperties(declaredFlags))
@@ -267,8 +277,6 @@ public class DocGenerator
 
                 if (!isPublic && !isProtected) continue;
                 if (!isPublic && isProtected && type.IsSealed) continue;
-                var xmlProperty = reader.GetMemberComment(property)?.Replace("\n", " ").Replace("<br>", " ")
-                    .Replace("|", "\\|").Trim() ?? "";
 
                 string modifiers = string.Empty;
                 if (isGetterPublic == isSetterPublic &&
@@ -299,9 +307,20 @@ public class DocGenerator
                     }
                 }
 
+                var xmlProperty = reader.GetMemberComments(property);
+                string summary = xmlProperty?.Summary?.Replace("\n", " ").Replace("|", "\\|").Trim() ?? "";
+                string? remarks = xmlProperty?.Remarks?.Trim();
+
                 var nullabilityInfo = new NullabilityInfoContext().Create(property);
+
                 propertyBuilder.AppendLine(
-                    $"| `{modifiers}{property.Name}` | {GetTypeReference(nullabilityInfo, type, property.PropertyType)} | {ResolveInlineTags(xmlProperty, type, context)} |");
+                    $"| `{modifiers}{property.Name}` | {GetTypeReference(nullabilityInfo, type, property.PropertyType)} | {ResolveInlineTags(summary, type, context)} |");
+
+                if (!string.IsNullOrEmpty(remarks))
+                {
+                    propertyRemarksBuilder.AppendLine(
+                        $"##### `{property.Name}` Remarks\n{ResolveInlineTags(remarks, type, context)}\n");
+                }
             }
 
             foreach (var method in type.GetMethods(declaredFlags))
@@ -345,10 +364,20 @@ public class DocGenerator
                                          $"{method.Name}{methodGenArgs}({joinedParams})");
                 methodBuilder.AppendLine();
 
-                string methodSummary = xmlMethod?.Summary?.Replace("\n", " ").Trim() ?? "";
+                string? methodSummary = xmlMethod?.Summary;
                 if (!string.IsNullOrWhiteSpace(methodSummary))
                 {
+                    methodBuilder.AppendLine();
+                    methodBuilder.AppendLine("##### Summary");
                     methodBuilder.AppendLine(ResolveInlineTags(methodSummary, type, context));
+                    methodBuilder.AppendLine();
+                }
+
+                string? methodRemarks = xmlMethod?.Remarks;
+                if (!string.IsNullOrWhiteSpace(methodRemarks))
+                {
+                    methodBuilder.AppendLine("##### Remarks");
+                    methodBuilder.AppendLine(methodRemarks);
                     methodBuilder.AppendLine();
                 }
 
@@ -415,11 +444,22 @@ public class DocGenerator
             string typeNamePretty = GetTypeReference(null, type, type, false);
 
             string template = $""""
+                               <<<<<<< HEAD
                                # {typeNamePretty}
 
                                {ResolveInlineTags(typeSummary, type, context)}
 
                                ## Definition
+                               =======
+                               # {typeNamePretty}
+
+                               ## Summary
+                               {typeSummary}
+
+                               {(!string.IsNullOrWhiteSpace(typeRemarks) ? $"## Remarks\n{typeRemarks!}" : string.Empty)}
+
+                               ## Definition
+                               >>>>>>> origin
 
                                **Namespace:** `{type.Namespace ?? "<Global>"}`  
                                **Assembly:** `{type.Assembly?.FullName?.Split(',')[0]}.dll`
@@ -442,19 +482,35 @@ public class DocGenerator
                                    ))}
                                ---
 
+                               <<<<<<< HEAD
                                ## Fields
 
                                | Name | Type | Description |
                                | --- | --- | --- |
                                {fieldBuilder}
+                               =======
+                               | Name | Type | Description |
+                               | --- | --- | --- |
+                               {fieldBuilder}
+                               ---
+                               {fieldRemarksBuilder}
+                               >>>>>>> origin
 
                                ---
 
+                               <<<<<<< HEAD
                                ## Properties
 
                                | Name | Type | Description |
                                | --- | --- | --- |
                                {propertyBuilder}
+                               =======
+                               | Name | Type | Description |
+                               | --- | --- | --- |
+                               {propertyBuilder}
+                               ---
+                               {propertyRemarksBuilder}
+                               >>>>>>> origin
 
                                ---
 
