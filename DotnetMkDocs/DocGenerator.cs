@@ -126,7 +126,7 @@ public class DocGenerator
         else return nolink;
     }
 
-    public string ResolveInlineTags(string xmlText, Type currentType, MetadataLoadContext context)
+    private string ResolveInlineTags_SeeCref(string xmlText, Type? currentType, MetadataLoadContext context)
     {
         if (string.IsNullOrEmpty(xmlText)) return string.Empty;
 
@@ -142,41 +142,43 @@ public class DocGenerator
             // Handle Types (T:)
             if (memberType == "T")
             {
-                Type? targetType = context.GetAssemblies()
-                    .Select(a => a.GetType(fullPath))
-                    .FirstOrDefault(t => t != null);
-
-                if (targetType != null)
+                if (currentType != null)
                 {
-                    return GetTypeReference(null, currentType, targetType);
-                }
+                    Type? targetType = context.GetAssemblies()
+                        .Select(a => a.GetType(fullPath))
+                        .FirstOrDefault(t => t != null);
 
+                    if (targetType != null)
+                    {
+                        return GetTypeReference(null, currentType, targetType);
+                    }
+                }
                 // Fallback if type isn't loaded/found (just show name)
                 return $"`{fullPath.Split('.').Last()}`";
             }
 
-            // Handle Members (M: Methods, P: Properties, F: Fields)
-            int lastDot = fullPath.IndexOf('('); // Handle method signatures if present
-            if (lastDot == -1) lastDot = fullPath.LastIndexOf('.');
-
-            if (lastDot > 0)
+            // Handle Members (M: Methods, P: Properties, F: Fields
+            int methodSignatureCutoff = fullPath.IndexOf('(');// method signature
+            string memberSignature = methodSignatureCutoff == -1 ? fullPath : fullPath.Substring(0, methodSignatureCutoff);
+            if (!string.IsNullOrEmpty(memberSignature))
             {
-                string typePath = fullPath.Substring(0, lastDot);
-                string memberName = fullPath.Substring(lastDot + 1);
+                int pivot = memberSignature.LastIndexOf('.');
+                string typePath = memberSignature.Substring(0, pivot);
+                string memberName = memberSignature.Substring(pivot + 1);
 
-                // Clean up method parameters out of the member name if they exist
-                if (memberName.Contains('(')) memberName = memberName.Substring(0, memberName.IndexOf('('));
-
-                Type? targetType = AppDomain.CurrentDomain.GetAssemblies()
+                if (currentType != null)
+                {
+                    Type? targetType = context.GetAssemblies()
                     .Select(a => a.GetType(typePath))
                     .FirstOrDefault(t => t != null);
 
-                if (targetType != null)
-                {
-                    string link = GetTypeReferenceCanonical(currentType, targetType);
-                    // Links directly to the type file, hitting the Markdown anchor tag for the member
-                    return
-                        $"[{GetTypeReference(null, currentType, targetType, false)}.{memberName}]({link}#{memberName.ToLower()})";
+                    if (targetType != null)
+                    {
+                        string link = GetTypeReferenceCanonical(currentType, targetType);
+                        // Links directly to the type file, hitting the Markdown anchor tag for the member
+                        return
+                            $"[{GetTypeReference(null, currentType, targetType, false)}.{memberName}]({link}#{memberName.ToLower()})";
+                    }
                 }
 
                 // fallback
@@ -185,6 +187,24 @@ public class DocGenerator
 
             return match.Value; // Fallback to original text if nothing matches well
         });
+    }
+    private string ResolveInlineTags_Paramref(string xmlText)
+    {
+        // Matches <paramref name="myParam" /> or <paramref name="myParam"></paramref>
+        string pattern = @"<paramref\s+name=""([^""]+)""\s*(?:/>|></paramref>)";
+
+        return Regex.Replace(xmlText, pattern, match =>
+        {
+            string paramName = match.Groups[1].Value;
+            return $"`{paramName}`";
+        });
+    }
+    public string ResolveInlineTags(string xmlText, Type? currentType, MetadataLoadContext context)
+    {
+        if (string.IsNullOrEmpty(xmlText)) return string.Empty;
+        xmlText = ResolveInlineTags_SeeCref(xmlText, currentType, context);
+        xmlText = ResolveInlineTags_Paramref(xmlText);
+        return xmlText;
     }
 
     public void GenerateForAssembly(string dllFilePath, string xmlFilePath, string assemblyName,
@@ -368,7 +388,7 @@ public class DocGenerator
                 if (!string.IsNullOrWhiteSpace(methodSummary))
                 {
                     methodBuilder.AppendLine();
-                    methodBuilder.AppendLine("##### Summary");
+                    methodBuilder.AppendLine("**Summary:**");
                     methodBuilder.AppendLine(ResolveInlineTags(methodSummary, type, context));
                     methodBuilder.AppendLine();
                 }
@@ -376,8 +396,8 @@ public class DocGenerator
                 string? methodRemarks = xmlMethod?.Remarks;
                 if (!string.IsNullOrWhiteSpace(methodRemarks))
                 {
-                    methodBuilder.AppendLine("##### Remarks");
-                    methodBuilder.AppendLine(methodRemarks);
+                    methodBuilder.AppendLine("**Remarks:**");
+                    methodBuilder.AppendLine(ResolveInlineTags(methodRemarks, type, context));
                     methodBuilder.AppendLine();
                 }
 
@@ -444,22 +464,14 @@ public class DocGenerator
             string typeNamePretty = GetTypeReference(null, type, type, false);
 
             string template = $""""
-                               <<<<<<< HEAD
-                               # {typeNamePretty}
-
-                               {ResolveInlineTags(typeSummary, type, context)}
-
-                               ## Definition
-                               =======
                                # {typeNamePretty}
 
                                ## Summary
-                               {typeSummary}
+                               {ResolveInlineTags(typeSummary, type, context)}
 
-                               {(!string.IsNullOrWhiteSpace(typeRemarks) ? $"## Remarks\n{typeRemarks!}" : string.Empty)}
+                               {(!string.IsNullOrWhiteSpace(typeRemarks) ? $"## Remarks\n{ResolveInlineTags(typeRemarks!, type, context)}" : string.Empty)}
 
                                ## Definition
-                               >>>>>>> origin
 
                                **Namespace:** `{type.Namespace ?? "<Global>"}`  
                                **Assembly:** `{type.Assembly?.FullName?.Split(',')[0]}.dll`
@@ -482,36 +494,22 @@ public class DocGenerator
                                    ))}
                                ---
 
-                               <<<<<<< HEAD
                                ## Fields
 
                                | Name | Type | Description |
                                | --- | --- | --- |
                                {fieldBuilder}
-                               =======
-                               | Name | Type | Description |
-                               | --- | --- | --- |
-                               {fieldBuilder}
-                               ---
+
                                {fieldRemarksBuilder}
-                               >>>>>>> origin
-
                                ---
-
-                               <<<<<<< HEAD
+                               
                                ## Properties
+                               
+                               | Name | Type | Description |
+                               | --- | --- | --- |
+                               {propertyBuilder}
 
-                               | Name | Type | Description |
-                               | --- | --- | --- |
-                               {propertyBuilder}
-                               =======
-                               | Name | Type | Description |
-                               | --- | --- | --- |
-                               {propertyBuilder}
-                               ---
                                {propertyRemarksBuilder}
-                               >>>>>>> origin
-
                                ---
 
                                ## Methods
@@ -549,6 +547,7 @@ public class DocGenerator
             foreach (var t in kvp.Value.OrderBy(x => x.Type.Name))
             {
                 string cleanSummary = t.Summary.Replace("\n", " ").Replace("|", "\\|").Trim();
+                cleanSummary = ResolveInlineTags(cleanSummary, null, context);
 
                 string[] targetNsParts = GetNamespaceParts(assemblyName, t.Type.Namespace ?? string.Empty, true);
 
